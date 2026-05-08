@@ -11,7 +11,7 @@ import (
 
 	"github.com/browningluke/opnsense-go/pkg/api"
 	"github.com/browningluke/opnsense-go/pkg/opnsense"
-	"github.com/yourusername/gopn/pkg/config"
+	"gopn/pkg/config"
 )
 
 // DefaultRetries is used when the caller does not override retry settings.

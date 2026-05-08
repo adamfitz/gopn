@@ -2,22 +2,27 @@
 //
 //   - Application-level structs (Rule, DuplicateGroup, ConsolidationSuggestion,
 //     AnalysisResult) that decouple downstream code from the opnsense-go types.
-//   - FetchAll: retrieves all rules from the OPNsense API.
+//   - FetchAll: retrieves all rules from the OPNsense API via the searchRule endpoint.
 //   - FindDuplicates: identifies logically identical rules.
 //   - FindConsolidations: suggests rules that could be merged via a port alias.
 //   - Table and JSON renderers for human and machine consumption.
 //
-// # Field mapping note
+// # How FetchAll works
 //
-// firewall.FilterRule fields are typed as api.SelectedMap (a string-backed named
-// type).  fromLibRule uses parser.ToString() on every field so this file is the
-// only place that needs updating if upstream types change.
+// The opnsense-go firewall.Controller only exposes GetFilter(ctx, id) for
+// individual rule lookup.  To list all rules we call the OPNsense
+// POST /firewall/filter/searchRule endpoint directly via api.Call.
 //
-// # Method name note
+// The searchRule response returns rows with plain string values for each
+// field — not the api.SelectedMap format used by the single-rule GET response.
+// We therefore define a local searchRow struct with plain string fields
+// and convert it into our application Rule struct.
 //
-// The generated controller method is GetFilterRules(ctx).  If your resolved
-// version of opnsense-go names it differently, update FetchAll below.
-// Run `go doc github.com/browningluke/opnsense-go/pkg/firewall` to confirm.
+// # Pagination
+//
+// rowCount: -1 asks OPNsense to return every rule in a single response.
+// If your OPNsense version does not support -1, increase the constant
+// fetchPageSize and the function will automatically paginate.
 package fwrules
 
 import (
@@ -27,10 +32,10 @@ import (
 	"io"
 	"strings"
 
-	"github.com/browningluke/opnsense-go/pkg/firewall"
+	"github.com/browningluke/opnsense-go/pkg/api"
 	"github.com/browningluke/opnsense-go/pkg/opnsense"
 	"github.com/olekukonko/tablewriter"
-	"github.com/yourusername/gopn/pkg/parser"
+	"gopn/pkg/parser"
 )
 
 // ---------------------------------------------------------------------------
@@ -69,14 +74,14 @@ type DuplicateGroup struct {
 // networks, action, interface, and protocol but differ only in destination
 // port — candidates for a single rule using an OPNsense port alias.
 type ConsolidationSuggestion struct {
-	// Key is a human-readable description: "srcNet -> dstNet [proto action iface]"
+	// Key is a human-readable label: "srcNet -> dstNet [proto action iface]"
 	Key   string   `json:"key"`
 	Ports []string `json:"ports"`
 	Rules []Rule   `json:"rules"`
 }
 
 // AnalysisResult bundles the full rule list with any analysis output so that
-// callers consuming --json output get everything in one payload.
+// callers consuming --json output receive everything in one payload.
 type AnalysisResult struct {
 	Rules       []Rule                    `json:"rules"`
 	Duplicates  []DuplicateGroup          `json:"duplicates,omitempty"`
@@ -87,43 +92,88 @@ type AnalysisResult struct {
 // Fetch
 // ---------------------------------------------------------------------------
 
+// searchRow matches the flat key-value shape returned by OPNsense in the
+// searchRule response body.  All fields are plain strings — OPNsense returns
+// the selected key (e.g. "pass", "in", "inet") rather than the full
+// api.SelectedMap object that the single-rule GET endpoint returns.
+type searchRow struct {
+	UUID            string `json:"uuid"`
+	Enabled         string `json:"enabled"`
+	Sequence        string `json:"sequence"`
+	Action          string `json:"action"`
+	Direction       string `json:"direction"`
+	Interface       string `json:"interface"`
+	IPProtocol      string `json:"ipprotocol"`
+	Protocol        string `json:"protocol"`
+	SourceNet       string `json:"source_net"`
+	SourcePort      string `json:"source_port"`
+	DestinationNet  string `json:"destination_net"`
+	DestinationPort string `json:"destination_port"`
+	Gateway         string `json:"gateway"`
+	Log             string `json:"log"`
+	Description     string `json:"description"`
+}
+
+// searchResponse is the envelope returned by POST /firewall/filter/searchRule.
+type searchResponse struct {
+	Rows     []searchRow `json:"rows"`
+	RowCount int         `json:"rowCount"`
+	Total    int         `json:"total"`
+}
+
 // FetchAll retrieves every configured firewall filter rule from OPNsense and
 // returns them sorted by sequence as application-level Rule structs.
+//
+// It calls POST /firewall/filter/searchRule with rowCount=-1 to request all
+// rules in a single response.  If your OPNsense version does not honour -1,
+// replace it with a large integer (e.g. 9999).
 func FetchAll(ctx context.Context, client opnsense.Client) ([]Rule, error) {
-	rulesMap, err := client.Firewall().GetFilterRules(ctx)
+	resp := &searchResponse{}
+	result, err := api.Call[searchResponse](
+		client.Firewall().Client(),
+		ctx,
+		api.RPCOpts{
+			BaseEndpoint: "/firewall/filter/searchRule",
+			Method:       "POST",
+			BodyParameters: map[string]interface{}{
+				"current":  1,
+				"rowCount": -1, // -1 = return all rows; use 9999 if unsupported
+			},
+		},
+		resp,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("fwrules: fetch: %w", err)
 	}
 
-	rules := make([]Rule, 0, len(rulesMap))
-	for uuid, r := range rulesMap {
-		rules = append(rules, fromLibRule(uuid, r))
+	rules := make([]Rule, 0, len(result.Rows))
+	for _, row := range result.Rows {
+		rules = append(rules, fromSearchRow(row))
 	}
 
 	sortBySequence(rules)
 	return rules, nil
 }
 
-// fromLibRule converts a firewall.FilterRule from the opnsense-go library into
-// our application Rule.  parser.ToString handles both plain string fields and
-// api.SelectedMap fields (named string type implementing fmt.Stringer).
-func fromLibRule(uuid string, r firewall.FilterRule) Rule {
+// fromSearchRow converts a searchRow (plain-string fields from the searchRule
+// response) into an application Rule.
+func fromSearchRow(row searchRow) Rule {
 	return Rule{
-		UUID:        uuid,
-		Enabled:     parser.ToBool(parser.ToString(r.Enabled)),
-		Action:      parser.ToString(r.Action),
-		Direction:   parser.ToString(r.Direction),
-		Interface:   parser.ToString(r.Interface),
-		IPProtocol:  parser.ToString(r.IPProtocol),
-		Protocol:    parser.ToString(r.Protocol),
-		SourceNet:   parser.Coalesce("any", parser.ToString(r.SourceNet)),
-		SourcePort:  parser.Coalesce("any", parser.ToString(r.SourcePort)),
-		DestNet:     parser.Coalesce("any", parser.ToString(r.DestinationNet)),
-		DestPort:    parser.Coalesce("any", parser.ToString(r.DestinationPort)),
-		Gateway:     parser.ToString(r.Gateway),
-		Description: parser.ToString(r.Description),
-		Log:         parser.ToBool(parser.ToString(r.Log)),
-		Sequence:    parser.ToString(r.Sequence),
+		UUID:        row.UUID,
+		Enabled:     parser.ToBool(row.Enabled),
+		Action:      row.Action,
+		Direction:   row.Direction,
+		Interface:   row.Interface,
+		IPProtocol:  row.IPProtocol,
+		Protocol:    parser.Coalesce("any", row.Protocol),
+		SourceNet:   parser.Coalesce("any", row.SourceNet),
+		SourcePort:  parser.Coalesce("any", row.SourcePort),
+		DestNet:     parser.Coalesce("any", row.DestinationNet),
+		DestPort:    parser.Coalesce("any", row.DestinationPort),
+		Gateway:     row.Gateway,
+		Description: row.Description,
+		Log:         parser.ToBool(row.Log),
+		Sequence:    row.Sequence,
 	}
 }
 
@@ -185,7 +235,7 @@ func consolidationKey(r Rule) string {
 }
 
 // FindConsolidations returns groups of rules that are candidates for merging
-// into a single rule with an OPNsense port alias.
+// into a single rule using an OPNsense port alias.
 func FindConsolidations(rules []Rule) []ConsolidationSuggestion {
 	index := make(map[string][]Rule)
 	for _, r := range rules {
