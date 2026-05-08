@@ -135,7 +135,7 @@ func FetchAll(ctx context.Context, client opnsense.Client) ([]Rule, error) {
 		api.RPCOpts{
 			BaseEndpoint: "/firewall/filter/searchRule",
 			Method:       "POST",
-			BodyParameters: map[string]interface{}{
+			BodyParameters: map[string]any{
 				"current":  1,
 				"rowCount": -1, // -1 = return all rows; use 9999 if unsupported
 			},
