@@ -1,6 +1,10 @@
 package main
 
-import "gopn/cmd"
+import (
+	"gopn/cmd"
+
+	_ "gopn/pkg/logger"
+)
 
 func main() {
 	cmd.Execute()

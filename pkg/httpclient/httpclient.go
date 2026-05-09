@@ -8,12 +8,13 @@ package httpclient
 
 import (
 	"fmt"
-	"os"
+	"log"
+	//"os"
+
+	"gopn/pkg/config"
 
 	"github.com/browningluke/opnsense-go/pkg/api"
 	"github.com/browningluke/opnsense-go/pkg/opnsense"
-	"gopn/pkg/config"
-	"gopn/pkg/logger"
 )
 
 // DefaultRetries is used when the caller does not override retry settings.
@@ -38,7 +39,7 @@ func New(cfg *config.AppConfig, opts *Options) (opnsense.Client, error) {
 	}
 
 	// Disable opnsense-go debug output
-	os.Setenv("OPNSENSE_DEBUG", "")
+	//os.Setenv("OPNSENSE_DEBUG", "")
 
 	retries := int64(DefaultRetries)
 	minBO := int64(1)
@@ -66,7 +67,7 @@ func New(cfg *config.AppConfig, opts *Options) (opnsense.Client, error) {
 		MaxBackoff:    maxBO,
 	})
 
-	logger.Log.Printf("Creating API client for host %s", cfg.Host)
+	log.Printf("Creating API client for host %s", cfg.Host)
 
 	return opnsense.NewClient(apiClient), nil
 }
